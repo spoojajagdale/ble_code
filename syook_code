@@ -1,0 +1,98 @@
+#include <stdio.h>
+#include <stdlib.h>
+#include <unistd.h>
+#include <string.h>
+#include <signal.h>
+#include <sys/socket.h>
+#include <bluetooth/bluetooth.h>
+#include <bluetooth/hci.h>
+#include <bluetooth/hci_lib.h>
+
+#define OGF_LE_CTL 0x08
+#define OCF_LE_SET_SCAN_ENABLE 0x000C
+
+int device_id = -1;
+int sock;
+
+void sigint_handler(int signal) {
+    hci_le_set_scan_enable(sock, 0x00, 1, 1000);
+    close(sock);
+    exit(0);
+}
+
+int main() {
+    signal(SIGINT, sigint_handler);
+
+    device_id = hci_get_route(NULL);
+    if (device_id < 0) {
+        perror("Could not get HCI device ID");
+        exit(1);
+    }
+
+    sock = hci_open_dev(device_id);
+    if (sock < 0) {
+        perror("Could not open HCI socket");
+        exit(1);
+    }
+
+    le_set_scan_parameters(sock);
+    le_enable_scan(sock);
+
+    while (1) {
+        struct hci_filter old_options;
+        socklen_t olen = sizeof(old_options);
+        struct hci_filter new_options;
+        socklen_t nlen = sizeof(new_options);
+
+        getsockopt(sock, SOL_HCI, HCI_FILTER, &old_options, &olen);
+
+        hci_filter_clear(&new_options);
+        hci_filter_set_ptype(HCI_EVENT_PKT, &new_options);
+        hci_filter_set_event(EVT_LE_META_EVENT, &new_options);
+        setsockopt(sock, SOL_HCI, HCI_FILTER, &new_options, sizeof(new_options));
+
+        uint8_t buf[HCI_MAX_EVENT_SIZE];
+        ssize_t len = read(sock, buf, sizeof(buf));
+
+        hci_filter_clear(&new_options);
+        hci_filter_set_ptype(HCI_EVENT_PKT, &new_options);
+        hci_filter_set_event(EVT_LE_META_EVENT, &new_options);
+        setsockopt(sock, SOL_HCI, HCI_FILTER, &new_options, sizeof(new_options));
+
+        evt_le_meta_event *meta = (evt_le_meta_event *)(buf + (1 + HCI_EVENT_HDR_SIZE));
+        le_advertising_info *info = (le_advertising_info *)(meta->data + 1);
+
+        if (meta->subevent != 0x02) {
+            continue;
+        }
+
+        // Extract accelerometer data from the advertising payload
+        uint8_t *adv_data = info->data;
+        while (adv_data < (info->data + info->length)) {
+            uint8_t len = adv_data[0];
+            uint8_t type = adv_data[1];
+
+            if (type == 0xFF) {  // Manufacturer Specific Data
+                if (len >= 7 && adv_data[2] == 0x4C && adv_data[3] == 0x00) {
+                    int16_t x = (adv_data[4] << 8) | adv_data[5];
+                    int16_t y = (adv_data[6] << 8) | adv_data[7];
+                    int16_t z = (adv_data[8] << 8) | adv_data[9];
+
+                    // TODO: Add logic to determine if the tag is moving or stationary based on accelerometer data
+                    if (x + y + z > MOVEMENT_THRESHOLD) {
+                        printf("Tag is moving\n");
+                    } else {
+                        printf("Tag is stationary\n");
+                    }
+                }
+            }
+
+            adv_data += (len + 1);
+        }
+    }
+
+    hci_le_set_scan_enable(sock, 0x00, 1, 1000);
+    close(sock);
+
+    return 0;
+}
